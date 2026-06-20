@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 ###############################################################################
 #
-#  setup_bspwm_kali.sh
+#  setup_bspwm_kali.sh (Versión 100% Automatizada - Fix Congelamiento)
 #  ---------------------------------------------------------------------------
 #  Automatiza la instalación y configuración de bspwm + sxhkd + picom
 #  + rofi corriendo encima de una sesión XFCE en Kali Linux.
+#  
+#  Incluye rutinas de neutralización profunda contra xfwm4 para evitar
+#  bloqueos de input (teclado/ratón congelados).
 #
 ###############################################################################
 
@@ -81,7 +84,6 @@ preflight_checks() {
 
 install_packages() {
     log "=== Instalando paquetes base ==="
-    # NOTA: Cambiado xterm por qterminal
     run_critical "Instalar bspwm, sxhkd, rofi, qterminal, wmctrl" \
         sudo apt-get install -y bspwm sxhkd rofi qterminal wmctrl
 
@@ -105,23 +107,54 @@ create_directories() {
     success "Directorios creados"
 }
 
-### ============================ FIXES DE XFCE ============================== ###
+### ============================ NEUTRALIZACIÓN DE XFWM4 ==================== ###
 
 tweak_xfce_session() {
-    log "=== Aplicando fixes a XFCE (Evitar Pantalla Negra) ==="
+    log "=== Aplicando neutralización profunda de xfwm4 ==="
     
-    # Apagar el compositor de xfwm4 para evitar que choque con picom
-    run_optional "Desactivar compositor nativo de xfwm4" \
+    # 1. Desactivar compositor nativo para que picom no choque
+    run_optional "Desactivar compositor de xfwm4" \
         xfconf-query -c xfwm4 -p /general/use_compositing -s false --create -t bool
-    
-    # Limpiar caché de sesión para evitar que xfwm4 y bspwm arranquen juntos
-    log "Limpiando ~/.cache/sessions/..."
-    rm -rf "$HOME/.cache/sessions/"*
-    success "Caché de sesiones limpiada con éxito"
 
-    # Eliminar atajos viejos
+    # 2. Apagar autoguardado de sesión (evita que XFCE reviva estados corruptos)
+    run_optional "Desactivar SaveOnExit" \
+        xfconf-query -c xfce4-session -p /general/SaveOnExit -s false --create -t bool
+
+    # 3. Eliminar sesiones cacheadas que provocan el conflicto de teclado
+    log "Purgando caché de sesiones previas..."
+    rm -rf "$HOME/.cache/sessions/"*
+
+    # 4. Modificar el XML base para que la sesión de emergencia llame a bspwm
+    log "Reescribiendo Failsafe session en xfconf..."
+    mkdir -p "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml"
+    local xml_file="$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml"
+    
+    if [ ! -f "$xml_file" ] && [ -f "/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml" ]; then
+        cp "/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml" "$xml_file"
+    fi
+    
+    if [ -f "$xml_file" ]; then
+        sed -i 's/value="xfwm4"/value="bspwm"/g' "$xml_file"
+    fi
+    
+    # Inyectar en memoria viva de xfconf para doble seguridad
+    run_optional "Inyectar bspwm en Client0_Command" \
+        xfconf-query -c xfce4-session -p /sessions/Failsafe/Client0_Command -t string -s "bspwm" -a
+
+    # 5. Crear desktop falso para anular llamadas XDG del sistema a xfwm4
+    cat > "$HOME/.config/autostart/xfwm4.desktop" << 'EOF'
+[Desktop Entry]
+Type=Application
+Name=xfwm4
+Exec=/bin/true
+Hidden=true
+EOF
+
+    # 6. Limpiar atajos viejos de XFCE
     run_optional "Quitar /commands/custom" xfconf-query -c xfce4-keyboard-shortcuts -p /commands/custom -r -R
     run_optional "Quitar /xfwm4/custom" xfconf-query -c xfce4-keyboard-shortcuts -p /xfwm4/custom -r -R
+
+    success "xfwm4 ha sido neutralizado desde la raíz del sistema"
 }
 
 ### ============================ CONFIGURACIONES ============================ ###
@@ -205,7 +238,7 @@ super + shift + {1-9,0}
 super + {1-9,0}
     bspc desktop -f '^{1-9,10}'
 EOF
-    success "sxhkdrc creado (usando tecla Super)"
+    success "sxhkdrc creado (Atajos configurados con Super/Windows)"
 }
 
 create_compositor_config() {
@@ -284,20 +317,6 @@ EOF
     success "Archivos de autostart creados"
 }
 
-### ============================ PASO MANUAL ================================ ###
-
-manual_step_xfwm4() {
-    echo -e "${YELLOW}${BOLD}============================================================${NC}"
-    echo -e "${YELLOW}${BOLD} PASO MANUAL OBLIGATORIO (Para evitar bugs del sistema)     ${NC}"
-    echo -e "${YELLOW}${BOLD}============================================================${NC}"
-    echo "1. Ve a: Configuración -> Sesión e Inicio (Session and Startup)"
-    echo "2. Pestaña 'Sesión' (Session)"
-    echo "3. Busca 'xfwm4' en la lista y cámbialo a 'Nunca' (Never)"
-    echo "4. Da clic en el botón 'Guardar Sesión' (Save Session) abajo."
-    echo
-    read -rp "Presiona ENTER cuando hayas guardado la sesión para finalizar... "
-}
-
 ### ============================ MAIN ======================================== ###
 
 main() {
@@ -310,10 +329,17 @@ main() {
     create_sxhkdrc
     create_compositor_config
     create_autostart_entries
-    manual_step_xfwm4
 
-    echo -e "${GREEN}${BOLD}¡Automatización completada!${NC}"
-    echo "Por favor REINICIA TU COMPUTADORA ahora para aplicar los cambios en limpio."
+    echo
+    echo -e "${GREEN}${BOLD}============================================================${NC}"
+    echo -e "${GREEN}${BOLD} ¡Automatización completada exitosamente!                   ${NC}"
+    echo -e "${GREEN}${BOLD}============================================================${NC}"
+    echo "El paso manual ha sido eliminado. xfwm4 fue desactivado desde la raíz."
+    echo
+    echo -e "${YELLOW}${BOLD}Por favor, REINICIA TU MÁQUINA VIRTUAL ahora mismo${NC}"
+    echo "para que la nueva configuración de sesión cargue en limpio:"
+    echo "Ejecuta: sudo reboot"
+    echo
 }
 
 main "$@"
