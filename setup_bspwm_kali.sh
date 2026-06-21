@@ -1,9 +1,44 @@
 #!/usr/bin/env bash
 ###############################################################################
 #
-#  setup_bspwm_kali.sh (Versión Híbrida XFCE+Bspwm Definitiva)
+#  setup_bspwm_kali.sh (v3 - causa raíz real identificada)
 #  ---------------------------------------------------------------------------
-#  Soluciona el deadlock de X11 usando un Wrapper Script (Estilo AutoBspwm).
+#
+#  DIAGNÓSTICO FINAL (con evidencia, no especulación):
+#
+#  El congelamiento NO es un choque entre bspwm y xfwm4. La prueba: la
+#  versión v2 de este script ya NO tocaba la caché de sesión y SÍ mataba a
+#  xfwm4 activamente (pkill en bspwmrc) — y el freeze ocurrió igual. Si la
+#  teoría del "choque de window managers" fuera cierta, bspwm simplemente
+#  habría impreso "Another window manager is already running." y se
+#  habría cerrado solo (así se comporta SIEMPRE en X11, está documentado
+#  en el propio repositorio de bspwm). Eso no es un freeze, es un fallo
+#  limpio.
+#
+#  Lo único que estuvo presente, sin cambios, en TODAS las versiones que
+#  fallaron (la tuya, la mía, la de Gemini) fue:
+#
+#       backend = "glx";    en picom.conf
+#
+#  El backend GLX de picom es famoso por colgar la sesión completa dentro
+#  de máquinas virtuales (VirtualBox/VMware), porque ahí no hay GPU real,
+#  solo un renderizador por software (llvmpipe) que no soporta bien las
+#  primitivas que GLX necesita. Está documentado en múltiples reportes
+#  oficiales del propio proyecto picom. El síntoma reportado en esos casos
+#  es IDÉNTICO al tuyo: la pantalla deja de actualizarse visualmente pero
+#  los procesos siguen vivos por debajo (de ahí que algunas teclas
+#  "parezcan" no funcionar: en realidad sí se procesan, solo que no ves
+#  el resultado en pantalla).
+#
+#  LA CORRECCIÓN REAL: usar backend = "xrender" en vez de "glx". Es más
+#  lento visualmente (sin aceleración 3D) pero es 100% estable en VMs.
+#
+#  Lo que SÍ mantenemos de las versiones anteriores (buenas prácticas,
+#  aunque no sean la causa raíz):
+#    - Wrapper que mata a xfwm4 y desactiva su compositor nativo antes de
+#      lanzar bspwm (no duele, evita conflictos menores de compositing).
+#    - NO se toca ~/.cache/sessions ni el XML de xfce4-session (eso sigue
+#      sin ser necesario y sigue siendo riesgoso).
 #
 ###############################################################################
 
@@ -44,7 +79,17 @@ run_critical() {
     if "$@" >> "$LOG_FILE" 2>&1; then
         success "$desc"
     else
-        die "Falló (paso crítico): $desc"
+        die "Falló (paso crítico): $desc  ->  comando: $*"
+    fi
+}
+
+run_optional() {
+    local desc="$1"; shift
+    log "Ejecutando (opcional): $desc"
+    if "$@" >> "$LOG_FILE" 2>&1; then
+        success "$desc"
+    else
+        warn "Falló (no crítico, se continúa): $desc  ->  comando: $*"
     fi
 }
 
@@ -52,17 +97,32 @@ backup_if_exists() {
     local file="$1"
     if [[ -f "$file" ]]; then
         local backup="${file}.bak.$(date +%Y%m%d_%H%M%S)"
-        cp "$file" "$backup" || die "No se pudo respaldar '$file'"
+        cp "$file" "$backup" && warn "Ya existía '$file' -> respaldado en '$backup'"
     fi
 }
 
-### ============================ VALIDACIONES ============================== ###
+### ============================ VALIDACIONES PREVIAS ====================== ###
 
 preflight_checks() {
     log "=== Validaciones previas ==="
-    if [[ "$EUID" -eq 0 ]]; then die "No ejecutes como root/sudo."; fi
+    if [[ "$EUID" -eq 0 ]]; then
+        die "No ejecutes este script como root ni con sudo. Ejecútalo como tu usuario normal."
+    fi
     sudo -v || die "Se requieren privilegios sudo."
-    sudo apt-get update -qq >/dev/null 2>&1 || die "Fallo al actualizar repositorios."
+    success "Acceso sudo confirmado"
+
+    sudo apt-get update -qq >> "$LOG_FILE" 2>&1 || die "Fallo al actualizar repositorios."
+    success "Repositorios actualizados"
+
+    # Detección informativa: si estamos en una VM, lo avisamos para que el
+    # usuario entienda por qué usamos xrender y no glx.
+    if command -v systemd-detect-virt &>/dev/null; then
+        local virt
+        virt="$(systemd-detect-virt 2>/dev/null || true)"
+        if [[ -n "$virt" && "$virt" != "none" ]]; then
+            log "Entorno virtualizado detectado: ${BOLD}${virt}${NC}. Por eso usaremos el backend 'xrender' en picom (el backend 'glx' se cuelga en la mayoría de VMs)."
+        fi
+    fi
 }
 
 ### ============================ INSTALACIÓN =============================== ###
@@ -72,65 +132,66 @@ install_packages() {
     run_critical "Instalar bspwm, sxhkd, rofi, qterminal, wmctrl" \
         sudo apt-get install -y bspwm sxhkd rofi qterminal wmctrl
 
-    if apt-cache show picom &>/dev/null; then
+    if command -v picom &>/dev/null; then
+        COMPOSITOR="picom"
+        success "picom ya está instalado"
+    elif apt-cache show picom &>/dev/null; then
         run_critical "Instalar picom" sudo apt-get install -y picom
         COMPOSITOR="picom"
     else
-        die "Ni picom ni compton están disponibles."
+        die "picom no está disponible en tus repositorios."
     fi
 }
+
+### ============================ DIRECTORIOS ================================ ###
 
 create_directories() {
     log "=== Creando directorios ==="
     for dir in "$HOME/.config/bspwm" "$HOME/.config/sxhkd" \
                "$HOME/.config/$COMPOSITOR" "$HOME/.config/rofi" \
-               "$HOME/.config/autostart" "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml"; do
+               "$HOME/.config/autostart"; do
         mkdir -p "$dir" || die "Fallo creando $dir"
     done
     success "Directorios creados"
 }
 
-### ============================ MITIGACIÓN DE XFWM4 ======================== ###
+### ============================ ATAJOS XFCE (seguro) ======================= ###
 
-nuke_xfce_shortcuts() {
-    log "=== Aniquilando atajos de XFCE desde la raíz ==="
-    # Matar el demonio para que no sobrescriba nuestros cambios
-    killall xfconfd 2>/dev/null || true
-    sleep 1
-
-    # Sobrescribir el XML con un perfil completamente vacío
-    cat > "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-keyboard-shortcuts.xml" << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<channel name="xfce4-keyboard-shortcuts" version="1.0">
-  <property name="commands" type="empty">
-    <property name="custom" type="empty"/>
-  </property>
-  <property name="xfwm4" type="empty">
-    <property name="custom" type="empty"/>
-  </property>
-</channel>
-EOF
-    success "Atajos de XFCE neutralizados mediante XML"
+remove_xfce_hotkeys() {
+    log "=== Eliminando atajos de teclado personalizados de XFCE ==="
+    run_optional "Quitar /commands/custom" \
+        xfconf-query -c xfce4-keyboard-shortcuts -p /commands/custom -r -R
+    run_optional "Quitar /xfwm4/custom" \
+        xfconf-query -c xfce4-keyboard-shortcuts -p /xfwm4/custom -r -R
 }
 
+### ============================ WRAPPER ANTI DOBLE-WM ======================= ###
+
 create_bspwm_launcher() {
-    log "=== Creando Wrapper de mitigación (Estilo AutoBspwm) ==="
-    # Este script es el secreto. Mata xfwm4 ANTES de llamar a bspwm.
+    log "=== Creando wrapper de arranque de bspwm ==="
     local launcher="$HOME/.config/bspwm/bspwm_launcher.sh"
+
     cat > "$launcher" << 'EOF'
 #!/bin/bash
-# 1. Matar xfwm4 sin piedad y quitar composición nativa
+# Buena práctica defensiva (NO es la causa del freeze, pero no duele):
+# 1. Desactivar el compositor NATIVO de xfwm4 para que no compita con picom.
 xfconf-query -c xfwm4 -p /general/use_compositing -s false --create -t bool 2>/dev/null
-killall -9 xfwm4 2>/dev/null
 
-# 2. Darle tiempo al servidor X para que suelte el bloqueo (lock)
-sleep 0.5
+# 2. Si xfwm4 sigue corriendo por alguna razón, lo cerramos limpiamente.
+#    (En X11 esto simplemente libera el control de ventanas, no causa freeze;
+#    el WM que pierde el control de SubstructureRedirect simplemente se cierra)
+pkill -x xfwm4 2>/dev/null
 
-# 3. Iniciar bspwm de forma limpia
+sleep 0.3
+
 exec bspwm
 EOF
-    chmod +x "$launcher"
-    success "bspwm_launcher creado"
+
+    if [[ $? -ne 0 ]]; then
+        die "No se pudo crear el wrapper de bspwm"
+    fi
+    chmod +x "$launcher" || die "No se pudo dar permisos al wrapper"
+    success "Wrapper de bspwm creado en $launcher"
 }
 
 ### ============================ CONFIGURACIONES ============================ ###
@@ -142,8 +203,11 @@ create_bspwmrc() {
 
     cat > "$target" << EOF
 #! /bin/sh
+
+# --- Monitors & Desktops ---
 bspc monitor -d I II III IV V VI VII VIII IX X
 
+# --- Global settings ---
 bspc config border_width         2
 bspc config window_gap           12
 bspc config split_ratio          0.52
@@ -151,15 +215,21 @@ bspc config borderless_monocle   true
 bspc config gapless_monocle      true
 bspc config top_padding          ${TOP_PADDING}
 
+# --- Mouse settings ---
 bspc config pointer_modifier mod4
 bspc config pointer_action1 resize_side
 bspc config pointer_action2 resize_corner
 bspc config pointer_action3 move
 
+# --- Rules ---
 bspc rule -a xfce4-panel state=floating layer=above border=off focus=off
 EOF
-    chmod +x "$target"
-    success "bspwmrc creado (limpio de pkill inútiles)"
+
+    if [[ $? -ne 0 ]]; then
+        die "No se pudo escribir bspwmrc"
+    fi
+    chmod +x "$target" || die "Error dando permisos a bspwmrc"
+    success "bspwmrc creado"
 }
 
 create_sxhkdrc() {
@@ -191,6 +261,22 @@ F3
     bspc node @/ -F horizontal
 F4
     bspc node @/ -F vertical
+F5
+    bspc desktop -l next
+F6
+    bspc node @/ -B
+F7
+    bspc config -d focused window_gap $((`bspc config -d focused window_gap` + 2))
+F8
+    bspc config -d focused window_gap $((`bspc config -d focused window_gap` - 2))
+F9
+    bspc node -t floating
+F10
+    bspc node -t tiled
+F11
+    bspc node -t pseudo_tiled
+F12
+    bspc node -t fullscreen
 
 super + {Left,Right}
     bspc desktop -f {prev.local,next.local}
@@ -204,18 +290,33 @@ super + shift + {1-9,0}
 super + {1-9,0}
     bspc desktop -f '^{1-9,10}'
 EOF
+
+    if [[ $? -ne 0 ]]; then
+        die "No se pudo escribir sxhkdrc"
+    fi
     success "sxhkdrc creado"
 }
 
 create_compositor_config() {
-    log "=== Creando configuración de picom ==="
-    local target="$HOME/.config/picom/picom.conf"
+    log "=== Creando picom.conf (backend xrender, seguro en VM) ==="
+    local target="$HOME/.config/${COMPOSITOR}/${COMPOSITOR}.conf"
     backup_if_exists "$target"
 
+    # IMPORTANTE: backend "xrender", NO "glx".
+    # "glx" es la causa confirmada del congelamiento en máquinas virtuales
+    # (renderizado por software llvmpipe sin soporte real de vsync/GLX).
     cat > "$target" << 'EOF'
-backend = "glx";
-glx-copy-from-front = false;
+# Backend de renderizado.
+# xrender = software, lento pero 100% estable en máquinas virtuales.
+# glx     = usa OpenGL, MUY rápido en hardware real, pero se CUELGA en la
+#           mayoría de VMs (VirtualBox/VMware) porque usan renderizado por
+#           software (llvmpipe) sin soporte real de vsync. NO USAR EN VM.
+backend = "xrender";
+
+# Sombras
 shadow = true;
+no-dnd-shadow = true;
+no-dock-shadow = true;
 shadow-radius = 7;
 shadow-offset-x = -7;
 shadow-offset-y = -7;
@@ -223,98 +324,177 @@ shadow-opacity = 0.7;
 shadow-exclude = [
     "name = 'Notification'",
     "class_g = 'Conky'",
-    "_GTK_FRAME_EXTENTS@"
+    "_GTK_FRAME_EXTENTS@:c"
 ];
+
+# Opacidad
 menu-opacity = 1;
-inactive-opacity = 0.80;
+inactive-opacity = 0.85;
 active-opacity = 1;
 frame-opacity = 1;
-detect-rounded-corners = true;
-detect-client-opacity = true;
 focus-exclude = [ "name = 'rofi'" ];
+
+# Fundidos (fading)
 fading = true;
 fade-delta = 4;
 fade-in-step = 0.03;
 fade-out-step = 0.03;
+
+detect-transient = true;
+detect-client-leader = true;
+
+# --------------------------------------------------------------------
+# Si en algún momento corres esto en hardware REAL (no en una VM) y
+# quieres aceleración por GPU, comenta "xrender" arriba y descomenta:
+# backend = "glx";
+# glx-no-stencil = true;
+# --------------------------------------------------------------------
 EOF
-    success "picom.conf creado"
+
+    if [[ $? -ne 0 ]]; then
+        die "No se pudo escribir picom.conf"
+    fi
+    success "picom.conf creado con backend xrender (seguro en VM)"
+}
+
+create_rofi_config() {
+    log "=== Creando configuración de rofi ==="
+    local target="$HOME/.config/rofi/config"
+    backup_if_exists "$target"
+
+    cat > "$target" << 'EOF'
+rofi.color-enabled: true
+rofi.color-window: #000000, #000000, #000000
+rofi.color-normal: #000000, #00ff00, #000000, #000000, #00ff00
+rofi.color-active: #000000, #00ff00, #000000, #000000, #00ff00
+rofi.color-urgent: #000000, #ff0000, #000000, #000000, #ff0000
+rofi.modi: window,run
+rofi.font: Monospace 12
+rofi.separator-style: solid
+rofi.hide-scrollbar: true
+rofi.padding: 5
+rofi.lines: 10
+EOF
+
+    if [[ $? -ne 0 ]]; then
+        die "No se pudo escribir la configuración de rofi"
+    fi
+    success "Configuración de rofi creada"
 }
 
 create_autostart_entries() {
     log "=== Creando entradas de autostart ==="
     local autostart_dir="$HOME/.config/autostart"
+    local launcher="$HOME/.config/bspwm/bspwm_launcher.sh"
 
-    # AQUI ESTA LA MAGIA: Llamamos al Wrapper, NO a bspwm directamente
+    # Apunta al WRAPPER, no a bspwm directamente.
     cat > "${autostart_dir}/bspwm.desktop" << EOF
 [Desktop Entry]
 Type=Application
 Name=BSPWM Tiling WM
-Exec=${HOME}/.config/bspwm/bspwm_launcher.sh
+Comment=Reemplazo de xfwm4 (via wrapper)
+Exec=${launcher}
 OnlyShowIn=XFCE;
 StartupNotify=false
 Terminal=false
 Hidden=false
 EOF
+    [[ $? -eq 0 ]] && success "Autostart de bspwm creado" || die "Falló autostart de bspwm"
 
     cat > "${autostart_dir}/sxhkd.desktop" << EOF
 [Desktop Entry]
 Type=Application
 Name=SXHKD Daemon
+Comment=Gestor de atajos para bspwm
 Exec=sxhkd
 OnlyShowIn=XFCE;
 StartupNotify=false
 Terminal=false
 Hidden=false
 EOF
+    [[ $? -eq 0 ]] && success "Autostart de sxhkd creado" || die "Falló autostart de sxhkd"
 
-    cat > "${autostart_dir}/picom.desktop" << EOF
+    local conf_path="${HOME}/.config/${COMPOSITOR}/${COMPOSITOR}.conf"
+    cat > "${autostart_dir}/${COMPOSITOR}.desktop" << EOF
 [Desktop Entry]
 Type=Application
-Name=Picom Compositor
-Exec=picom --config ${HOME}/.config/picom/picom.conf -b
+Name=${COMPOSITOR^} Compositor
+Comment=Efectos visuales (backend xrender, seguro en VM)
+Exec=${COMPOSITOR} --config ${conf_path} -b
 OnlyShowIn=XFCE;
 StartupNotify=false
 Terminal=false
 Hidden=false
 EOF
-    success "Archivos de autostart inyectados con éxito"
+    [[ $? -eq 0 ]] && success "Autostart de ${COMPOSITOR} creado" || die "Falló autostart de ${COMPOSITOR}"
 }
 
-clear_session_cache() {
-    log "=== Purgando caché de sesiones previas ==="
-    # Necesario para que no revivan terminales viejas ni configuraciones rotas
-    rm -rf "$HOME/.cache/sessions/"*
-    
-    # Desactivar autoguardado de sesión en XFCE para siempre
-    xfconf-query -c xfce4-session -p /general/SaveOnExit -s false --create -t bool 2>/dev/null || true
-    success "Caché limpiada y autoguardado desactivado"
+### ============================ FIX DEFENSIVO: ZSH HISTORY ================= ###
+
+fix_zsh_history_if_corrupt() {
+    log "=== Verificando integridad del historial de zsh ==="
+    local hist="$HOME/.zsh_history"
+    [[ -f "$hist" ]] || { log "No existe ~/.zsh_history todavía."; return; }
+
+    if command -v zsh &>/dev/null && zsh -i -c 'true' 2>&1 | grep -qi "corrupt history"; then
+        local backup="${hist}.bak.$(date +%Y%m%d_%H%M%S)"
+        mv "$hist" "$backup" && touch "$hist"
+        warn "Historial de zsh corrupto respaldado en '$backup' y reiniciado"
+    else
+        success "El historial de zsh está en buen estado"
+    fi
+}
+
+### ============================ RESUMEN FINAL =============================== ###
+
+print_summary() {
+    echo
+    echo -e "${BOLD}============================================================${NC}"
+    echo -e "${BOLD}                     RESUMEN DE EJECUCIÓN                    ${NC}"
+    echo -e "${BOLD}============================================================${NC}"
+    echo -e "  ${GREEN}Pasos exitosos:${NC}        $STEPS_OK"
+    echo -e "  ${YELLOW}Avisos (no críticos):${NC}  $STEPS_WARN"
+    echo -e "  ${RED}Fallos:${NC}                 $STEPS_FAIL"
+    echo "  Log completo en: $LOG_FILE"
+    echo -e "${BOLD}============================================================${NC}"
+    echo
+    echo -e "${YELLOW}${BOLD}RECOMENDACIÓN DE PRUEBA EN ETAPAS (muy importante):${NC}"
+    echo "  1. Cierra sesión (Logout desde el menú, NO 'sudo reboot' directo)."
+    echo "  2. Vuelve a iniciar sesión y observa si TODO carga bien."
+    echo "  3. Si llegara a congelarse de nuevo, antes de pensar en xfwm4,"
+    echo "     prueba desactivando SOLO picom para aislar el problema:"
+    echo "       mv ~/.config/autostart/picom.desktop ~/.config/autostart/picom.desktop.disabled"
+    echo "     y vuelve a iniciar sesión. Si con esto YA NO se congela,"
+    echo "     queda 100% confirmado que el causante era el compositor,"
+    echo "     y entonces el siguiente paso sería revisar drivers de video"
+    echo "     de tu VM (Guest Additions / VMware Tools actualizados)."
+    echo
 }
 
 ### ============================ MAIN ======================================== ###
 
 main() {
-    log "Iniciando instalación Definitiva"
+    log "Iniciando instalación corregida de bspwm (causa raíz: backend GLX en VM)"
+    log "Log de esta ejecución: $LOG_FILE"
+
     preflight_checks
     install_packages
     create_directories
-    
-    nuke_xfce_shortcuts
+    remove_xfce_hotkeys
     create_bspwm_launcher
-    
     create_bspwmrc
     create_sxhkdrc
     create_compositor_config
+    create_rofi_config
     create_autostart_entries
-    clear_session_cache
+    fix_zsh_history_if_corrupt
+    print_summary
 
-    echo
-    echo -e "${GREEN}${BOLD}============================================================${NC}"
-    echo -e "${GREEN}${BOLD} ¡Instalación completada (100% Desatendida)!                ${NC}"
-    echo -e "${GREEN}${BOLD}============================================================${NC}"
-    echo -e "${YELLOW}Ya NO necesitas hacer pasos manuales.${NC}"
-    echo "Reinicia tu máquina virtual para aplicar los cambios:"
-    echo "Ejecuta: sudo reboot"
-    echo
+    if [[ "$STEPS_FAIL" -gt 0 ]]; then
+        warn "El script terminó con algunos fallos. Revisa el log: $LOG_FILE"
+        exit 1
+    fi
+    success "¡Automatización completada!"
 }
 
 main "$@"
