@@ -181,34 +181,84 @@ remove_xfce_hotkeys() {
     fi
 }
 
-### ============================ WRAPPER ANTI DOBLE-WM ======================= ###
+### ============================ SCRIPT MAESTRO DE SESIÓN ==================== ###
+#
+# POR QUÉ ESTO REEMPLAZA A LOS 3 AUTOSTART SEPARADOS:
+#
+# XDG Autostart NO garantiza ningún orden de ejecución entre archivos
+# .desktop — todos se lanzan casi en paralelo. Eso causaba dos bugs
+# intermitentes:
+#   1. picom arrancando ANTES de que xfwm4 fuera matado/desactivado ->
+#      dos compositores compiten un instante -> backbuffer corrupto ->
+#      el "cuadro negro" que aparecía a veces sí, a veces no.
+#   2. xfce4-panel re-mapeándose ANTES de que bspwm esté listo para
+#      aplicarle su regla -> el panel desaparece en un logout/login
+#      normal (más rápido) pero no en un reinicio completo (más lento).
+#
+# La solución es UN SOLO script de orquestación, con orden secuencial
+# real y verificación activa (no solo "sleep a ciegas") de cada paso.
+#
+create_session_start_script() {
+    log "=== Creando script maestro de orquestación de sesión ==="
+    local target="$HOME/.config/bspwm/session_start.sh"
+    local conf_path="${HOME}/.config/${COMPOSITOR}/${COMPOSITOR}.conf"
 
-create_bspwm_launcher() {
-    log "=== Creando wrapper de arranque de bspwm ==="
-    local launcher="$HOME/.config/bspwm/bspwm_launcher.sh"
-
-    cat > "$launcher" << 'EOF'
+    cat > "$target" << EOF
 #!/bin/bash
-# Buena práctica defensiva (NO es la causa del freeze, pero no duele):
-# 1. Desactivar el compositor NATIVO de xfwm4 para que no compita con picom.
+SESSION_LOG="\$HOME/.cache/bspwm_session_start.log"
+echo "=== Sesión iniciada: \$(date) ===" >> "\$SESSION_LOG"
+
+# --- PASO 1: garantizar que xfwm4 no interfiera ---
 xfconf-query -c xfwm4 -p /general/use_compositing -s false --create -t bool 2>/dev/null
-
-# 2. Si xfwm4 sigue corriendo por alguna razón, lo cerramos limpiamente.
-#    (En X11 esto simplemente libera el control de ventanas, no causa freeze;
-#    el WM que pierde el control de SubstructureRedirect simplemente se cierra)
 pkill -x xfwm4 2>/dev/null
+sleep 0.5
 
+# --- PASO 2: lanzar bspwm y ESPERAR activamente a que esté listo ---
+# (en vez de un sleep a ciegas, comprobamos con bspc cada 0.2s, máx 4s)
+pkill -x bspwm 2>/dev/null
+bspwm &
+for i in \$(seq 1 20); do
+    if bspc query -M &>/dev/null; then
+        echo "bspwm activo tras \${i} intento(s) (\$((i*200))ms)" >> "\$SESSION_LOG"
+        break
+    fi
+    sleep 0.2
+done
+if ! bspc query -M &>/dev/null; then
+    echo "ADVERTENCIA: bspwm no respondió tras 4 segundos" >> "\$SESSION_LOG"
+fi
+
+# --- PASO 3: lanzar sxhkd (ya con bspwm garantizado activo) ---
+pkill -x sxhkd 2>/dev/null
+sleep 0.2
+sxhkd &
+echo "sxhkd lanzado" >> "\$SESSION_LOG"
+
+# --- PASO 4: lanzar el compositor (xfwm4 ya está muerto, sin carrera) ---
+pkill -x ${COMPOSITOR} 2>/dev/null
 sleep 0.3
+${COMPOSITOR} --config "${conf_path}" -b
+echo "${COMPOSITOR} lanzado" >> "\$SESSION_LOG"
 
-exec bspwm
+# --- PASO 5: reiniciar el panel para que tome la regla de bspwm ---
+# (necesario porque en un logout/login puede haberse mapeado antes de
+#  que la regla "xfce4-panel state=floating layer=above" existiera)
+sleep 1
+pkill -x xfce4-panel 2>/dev/null
+sleep 0.5
+xfce4-panel &
+echo "xfce4-panel reiniciado" >> "\$SESSION_LOG"
+
+echo "=== Orquestación completa: \$(date) ===" >> "\$SESSION_LOG"
 EOF
 
     if [[ $? -ne 0 ]]; then
-        die "No se pudo crear el wrapper de bspwm"
+        die "No se pudo crear el script maestro de sesión"
     fi
-    chmod +x "$launcher" || die "No se pudo dar permisos al wrapper"
-    success "Wrapper de bspwm creado en $launcher"
+    chmod +x "$target" || die "No se pudo dar permisos al script maestro"
+    success "Script maestro creado en $target"
 }
+
 
 ### ============================ CONFIGURACIONES ============================ ###
 
@@ -410,50 +460,32 @@ EOF
 }
 
 create_autostart_entries() {
-    log "=== Creando entradas de autostart ==="
+    log "=== Creando entrada de autostart única (orquestada) ==="
     local autostart_dir="$HOME/.config/autostart"
-    local launcher="$HOME/.config/bspwm/bspwm_launcher.sh"
+    local session_script="$HOME/.config/bspwm/session_start.sh"
 
-    # Apunta al WRAPPER, no a bspwm directamente.
-    cat > "${autostart_dir}/bspwm.desktop" << EOF
+    # Limpieza: si existían los 3 autostart separados de versiones
+    # anteriores del script, los eliminamos para que no compitan en
+    # paralelo con el script maestro nuevo.
+    for old_file in bspwm.desktop sxhkd.desktop picom.desktop compton.desktop; do
+        if [[ -f "${autostart_dir}/${old_file}" ]]; then
+            rm -f "${autostart_dir}/${old_file}"
+            warn "Eliminado autostart antiguo (causaba la carrera): ${old_file}"
+        fi
+    done
+
+    cat > "${autostart_dir}/bspwm-session.desktop" << EOF
 [Desktop Entry]
 Type=Application
-Name=BSPWM Tiling WM
-Comment=Reemplazo de xfwm4 (via wrapper)
-Exec=${launcher}
+Name=BSPWM Session Orchestrator
+Comment=Lanza xfwm4-kill, bspwm, sxhkd y ${COMPOSITOR} en orden garantizado
+Exec=${session_script}
 OnlyShowIn=XFCE;
 StartupNotify=false
 Terminal=false
 Hidden=false
 EOF
-    [[ $? -eq 0 ]] && success "Autostart de bspwm creado" || die "Falló autostart de bspwm"
-
-    cat > "${autostart_dir}/sxhkd.desktop" << EOF
-[Desktop Entry]
-Type=Application
-Name=SXHKD Daemon
-Comment=Gestor de atajos para bspwm
-Exec=sxhkd
-OnlyShowIn=XFCE;
-StartupNotify=false
-Terminal=false
-Hidden=false
-EOF
-    [[ $? -eq 0 ]] && success "Autostart de sxhkd creado" || die "Falló autostart de sxhkd"
-
-    local conf_path="${HOME}/.config/${COMPOSITOR}/${COMPOSITOR}.conf"
-    cat > "${autostart_dir}/${COMPOSITOR}.desktop" << EOF
-[Desktop Entry]
-Type=Application
-Name=${COMPOSITOR^} Compositor
-Comment=Efectos visuales (backend xrender, seguro en VM)
-Exec=${COMPOSITOR} --config ${conf_path} -b
-OnlyShowIn=XFCE;
-StartupNotify=false
-Terminal=false
-Hidden=false
-EOF
-    [[ $? -eq 0 ]] && success "Autostart de ${COMPOSITOR} creado" || die "Falló autostart de ${COMPOSITOR}"
+    [[ $? -eq 0 ]] && success "Autostart único creado (apunta al script maestro)" || die "Falló la creación del autostart"
 }
 
 ### ============================ FIX DEFENSIVO: ZSH HISTORY ================= ###
@@ -508,7 +540,7 @@ main() {
     install_packages
     create_directories
     remove_xfce_hotkeys
-    create_bspwm_launcher
+    create_session_start_script
     create_bspwmrc
     create_sxhkdrc
     create_compositor_config
