@@ -158,11 +158,27 @@ create_directories() {
 ### ============================ ATAJOS XFCE (seguro) ======================= ###
 
 remove_xfce_hotkeys() {
-    log "=== Eliminando atajos de teclado personalizados de XFCE ==="
-    run_optional "Quitar /commands/custom" \
-        xfconf-query -c xfce4-keyboard-shortcuts -p /commands/custom -r -R
-    run_optional "Quitar /xfwm4/custom" \
-        xfconf-query -c xfce4-keyboard-shortcuts -p /xfwm4/custom -r -R
+    log "=== Eliminando TODOS los atajos de teclado de XFCE (de fábrica + personalizados) ==="
+    # OJO: XFCE guarda los atajos en dos sub-árboles por canal:
+    #   /xfwm4/default    y  /commands/default   -> los de FÁBRICA (Alt+Tab, Alt+F4, Ctrl+Alt+T, etc.)
+    #   /xfwm4/custom     y  /commands/custom    -> solo los que el usuario personalizó a mano
+    #
+    # La versión anterior de este script solo borraba "/custom", por eso la
+    # mayoría de los atajos (los de fábrica) seguían activos. Ahora borramos
+    # el árbol completo de cada canal para eliminar TODOS, de raíz.
+    run_optional "Quitar TODO /commands (default + custom)" \
+        xfconf-query -c xfce4-keyboard-shortcuts -p /commands -r -R
+    run_optional "Quitar TODO /xfwm4 (default + custom)" \
+        xfconf-query -c xfce4-keyboard-shortcuts -p /xfwm4 -r -R
+
+    # Verificación: si después de esto siguen existiendo propiedades, avisamos.
+    if xfconf-query -c xfce4-keyboard-shortcuts -p /xfwm4 -l &>/dev/null; then
+        warn "Todavía quedan propiedades bajo /xfwm4. Puede que xfwm4 esté"
+        warn "corriendo en este momento y las haya regenerado. Verifica con:"
+        warn "  ps aux | grep xfwm4"
+    else
+        success "Confirmado: no quedan atajos bajo /xfwm4"
+    fi
 }
 
 ### ============================ WRAPPER ANTI DOBLE-WM ======================= ###
@@ -312,6 +328,17 @@ create_compositor_config() {
 #           mayoría de VMs (VirtualBox/VMware) porque usan renderizado por
 #           software (llvmpipe) sin soporte real de vsync. NO USAR EN VM.
 backend = "xrender";
+
+# FIX para el bug del "cuadro negro" al abrir/cerrar ventanas:
+# El backend xrender a veces calcula mal qué región de pantalla repintar
+# (su "damage tracking"). Esto deja basura visual (rectángulos negros) que
+# no se borra ni siquiera al cerrar la ventana. Confirmado en el issue
+# oficial de picom #626 ("Weird black semi opaque rectangles when terminal
+# is opened" -> se arregla con use-damage = false).
+# Costo: redibuja la pantalla completa en cada frame en vez de solo la
+# parte que cambió. Es menos eficiente, pero en una VM con xrender ya
+# estamos sacrificando rendimiento de todos modos, así que no se nota.
+use-damage = false;
 
 # Sombras
 shadow = true;
